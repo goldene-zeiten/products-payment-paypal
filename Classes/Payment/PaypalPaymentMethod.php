@@ -14,6 +14,7 @@ use GoldeneZeiten\Products\Core\Domain\Repository\OrderRepository;
 use GoldeneZeiten\Products\Core\Domain\ValueObject\Money;
 use GoldeneZeiten\Products\Core\Payment\RedirectPaymentMethodInterface;
 use GoldeneZeiten\Products\Core\Payment\StaticWebhookPaymentMethodInterface;
+use GoldeneZeiten\Products\Payment\Paypal\Amount\PaypalAmountFormatter;
 use GoldeneZeiten\Products\Payment\Paypal\Configuration\PaypalConfiguration;
 use GoldeneZeiten\Products\Payment\Paypal\Configuration\PaypalConfigurationFactory;
 use GoldeneZeiten\Products\Payment\Paypal\Domain\Dto\PaypalCapture;
@@ -58,6 +59,7 @@ final class PaypalPaymentMethod implements RedirectPaymentMethodInterface, Stati
         private readonly PaypalOrderClient $orderClient,
         private readonly PaypalWebhookVerifier $webhookVerifier,
         private readonly OrderRepository $orderRepository,
+        private readonly PaypalAmountFormatter $amountFormatter,
         private readonly LoggerInterface $logger,
     ) {}
 
@@ -133,8 +135,27 @@ final class PaypalPaymentMethod implements RedirectPaymentMethodInterface, Stati
         if (!$this->webhookVerifier->isSignatureValid($request, $body, $configuration)) {
             return PaymentResult::failed('PayPal webhook signature could not be verified.');
         }
+        if (in_array((string)($event['event_type'] ?? ''), self::HANDLED_CAPTURE_EVENTS, true)
+            && !$this->webhookCaptureBelongsToOrder((array)($event['resource'] ?? []), $order)
+        ) {
+            $this->logger->warning('PayPal webhook capture does not match the order.', ['order' => $order->getUid()]);
+            return PaymentResult::failed('The PayPal payment did not match the order.');
+        }
 
         return $this->interpretEvent($event);
+    }
+
+    /**
+     * The per-order callback token only proves the caller owns *some* order of this shop. The capture in
+     * the verified body must name this order by its `custom_id` and settle its total, as on the static
+     * webhook.
+     *
+     * @param array<string, mixed> $resource
+     */
+    private function webhookCaptureBelongsToOrder(array $resource, Order $order): bool
+    {
+        return (string)($resource['custom_id'] ?? '') === (string)($order->getUid() ?? 0)
+            && $this->webhookAmountMatches($resource, $order);
     }
 
     /**
@@ -199,7 +220,7 @@ final class PaypalPaymentMethod implements RedirectPaymentMethodInterface, Stati
             return false;
         }
 
-        return Money::fromDecimalString((string)$amount['value'])->getCents() === $order->getTotalGross()->getCents()
+        return $this->amountFormatter->equals(Money::fromDecimalString((string)$amount['value']), $order->getTotalGross(), $order->getCurrency())
             && strtoupper((string)($amount['currency_code'] ?? '')) === strtoupper($order->getCurrency());
     }
 
@@ -276,7 +297,7 @@ final class PaypalPaymentMethod implements RedirectPaymentMethodInterface, Stati
     {
         return $capture->customId === (string)($order->getUid() ?? 0)
             && $capture->amount !== null
-            && $capture->amount->getCents() === $order->getTotalGross()->getCents()
+            && $this->amountFormatter->equals($capture->amount, $order->getTotalGross(), $order->getCurrency())
             && strtoupper($capture->currency) === strtoupper($order->getCurrency());
     }
 
